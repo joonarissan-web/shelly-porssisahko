@@ -61,7 +61,11 @@
    * @param {*} e 
    * @returns 
    */
-  let avgn = (e) => qs(e).value == "avg" ? "avg" : n(qs(e).value);
+  let avgn = (e) => {
+  let v = qs(e).value;
+  if (v === "avg" || v === "avg2") return v;
+  return n(v);
+}
 
   /**
    * Callback called by main loop
@@ -140,7 +144,12 @@
       qs("m2-pe2").value = `${ci.m2.pe2}`.padStart(2, "0");
       qs("m2-cnt2").value = ci.m2.c2;
       checkCustomPeriodDisplay(ci.m2.p);
-
+	  if (state && state.s && state.s.p && state.s.p[0] && state.s.p[0].avg2) {
+		  qs("avg2-info").innerHTML =
+			"Kuukauden keskihinta: " +
+			state.s.p[0].avg2.toFixed(2) +
+			" c/kWh";
+		}
       configRead = true;
 
     } catch (err) {

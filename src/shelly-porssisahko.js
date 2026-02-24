@@ -66,6 +66,7 @@ const CNST = {
        * 0: manual mode (on/off toggle)
        * 1: price limit
        * 2: cheapest hours 
+	   * 3: consumption effect: cheapest hours
       */
       mode: 0,
       /** Settings for mode 0 (manual) */
@@ -101,6 +102,10 @@ const CNST = {
         /** How many cheapest hours (custom period 2) */
         c2: 0,
       },
+	  m3: {
+        /** Price limit limit - if price <= relay output command is set on [c/kWh] */
+        l: 0
+	  },
       /** Backup hours [binary] (example: 0b111111 = 00, 01, 02, 03, 04, 05) */
       b: 0b0,
       /** Relay output command if clock time is not known [0/1] */
@@ -146,29 +151,21 @@ let _ = {
     enCnt: 0,
     /** price info [0] = today, [1] = tomorrow */
     p: [
+		{
+		  ts: 0,
+		  now: 0,
+		  low: 0,
+		  high: 0,
+		  avg: 0,
+		  avg2: 0
+		},
       {
-        /** time when prices were read */
-        ts: 0,
-        /** current price */
-        now: 0,
-        /** lowest price of  the day */
-        low: 0,
-        /** highest price of the day */
-        high: 0,
-        /** average price of the day */
-        avg: 0
-      },
-      {
-        /** time when prices were read */
-        ts: 0,
-        /** current price (not valid for tomorrow) */
-        now: 0,
-        /** lowest price of  the day */
-        low: 0,
-        /** highest price of the day */
-        high: 0,
-        /** average price of the day */
-        avg: 0
+		  ts: 0,
+		  now: 0,
+		  low: 0,
+		  high: 0,
+		  avg: 0,
+		  avg2: 0
       }
     ]
   },
@@ -197,6 +194,13 @@ let _cnt = 0;
 let _start = 0;
 let _end = 0;
 let cmd = []; // Active commands for each instances (internal)
+let monthData = {
+  ym: "",        // "2026-02"
+  sum: 0,
+  days: 0,
+  avg2: 0,
+  lastUpdateDay: ""
+};
 
 /**
  * Previous epoch time
@@ -774,6 +778,49 @@ function getPrices(dayIndex) {
           //Calculate average and update timestamp
           _.s.p[dayIndex].avg = _.p[dayIndex].length > 0 ? (_.s.p[dayIndex].avg / _.p[dayIndex].length) : 0;
           _.s.p[dayIndex].ts = epoch(now);
+		  
+		  // ===============================
+		// KUUKAUSIKESKIARVO (vain today)
+		// ===============================
+		if (dayIndex === 0) {
+
+		  let nowDate = new Date();
+		  let ym = nowDate.getFullYear() + "-" + ("0" + (nowDate.getMonth()+1)).slice(-2);
+		  let todayStr =
+		  nowDate.getFullYear() + "-" +
+		  ("0" + (nowDate.getMonth()+1)).slice(-2) + "-" +
+		  ("0" + nowDate.getDate()).slice(-2);
+
+		  // Jos kuukausi vaihtunut → nollaa
+		  if (monthData.ym !== ym) {
+			monthData = {
+			  ym: ym,
+			  sum: 0,
+			  days: 0,
+			  avg2: 0,
+			  lastUpdateDay: ""
+			};
+		  }
+
+		  // Estä tuplalaskenta samalle päivälle
+		  if (monthData.lastUpdateDay !== todayStr) {
+
+			monthData.sum += _.s.p[0].avg;
+			monthData.days += 1;
+			monthData.lastUpdateDay = todayStr;
+
+			monthData.avg2 = monthData.sum / monthData.days;
+
+			Shelly.call("KVS.Set", {
+			  key: "monthData",
+			  value: JSON.stringify(monthData)
+			});
+
+			log("Monthly avg updated: " + monthData.avg2);
+		  }
+
+		  _.s.p[0].avg2 = monthData.avg2;
+		}
 
           if (_.p[dayIndex].length < 23) {
             //Let's assume that if we have data for at least 23 hours everything is OK
@@ -1018,7 +1065,6 @@ let _sum = 0;
 function isCheapestHour(inst) {
   let cfg = _.c.i[inst];
 
-  //Safety checks
   cfg.m2.ps = limit(0, cfg.m2.ps, 23);
   cfg.m2.pe = limit(cfg.m2.ps, cfg.m2.pe, 24);
   cfg.m2.ps2 = limit(0, cfg.m2.ps2, 23);
@@ -1026,60 +1072,52 @@ function isCheapestHour(inst) {
   cfg.m2.c = limit(0, cfg.m2.c, cfg.m2.p > 0 ? cfg.m2.p : cfg.m2.pe - cfg.m2.ps);
   cfg.m2.c2 = limit(0, cfg.m2.c2, cfg.m2.pe2 - cfg.m2.ps2);
 
-  //This is (and needs to be) 1:1 in both frontend and backend code
-  let cheapest = [];
+  // 🔥 YHDISTÄ 48h JAKSO
+  let prices = (_.p[1] && _.p[1].length > 0)
+    ? _.p[0].concat(_.p[1])
+    : _.p[0];
 
-  //Select increment (a little hacky - to support custom periods too)
+  if (!prices || prices.length === 0)
+    return false;
+
+  let cheapest = [];
   _inc = cfg.m2.p < 0 ? 1 : cfg.m2.p;
 
-  for (_i = 0; _i < _.p[0].length; _i += _inc) {
-    _cnt = (cfg.m2.p == -2 && _i >= 1 ? cfg.m2.c2 : cfg.m2.c);
+  for (_i = 0; _i < prices.length; _i += _inc) {
 
-    //Safety check
+    _cnt = (cfg.m2.p == -2 && _i >= 1 ? cfg.m2.c2 : cfg.m2.c);
     if (_cnt <= 0)
       continue;
 
-    //Create array of indexes in selected period
     let order = [];
 
-    //If custom period -> select hours from that range. Otherwise use this period
     _start = _i;
     _end = (_i + cfg.m2.p);
 
     if (cfg.m2.p < 0 && _i == 0) {
-      //Custom period 1 
       _start = cfg.m2.ps;
       _end = cfg.m2.pe;
-
     } else if (cfg.m2.p == -2 && _i == 1) {
-      //Custom period 2
       _start = cfg.m2.ps2;
       _end = cfg.m2.pe2;
     }
 
     for (_j = _start; _j < _end; _j++) {
-      //If we have less hours than 24 then skip the rest from the end
-      if (_j > _.p[0].length - 1)
+      if (_j > prices.length - 1)
         break;
-
       order.push(_j);
     }
 
     if (cfg.m2.s) {
-      //Find cheapest in a sequence
-      //Loop through each possible starting index and compare average prices
       _avg = 999;
       _startIndex = 0;
 
       for (_j = 0; _j <= order.length - _cnt; _j++) {
         _sum = 0;
-
-        //Calculate sum of these sequential hours
         for (_k = _j; _k < _j + _cnt; _k++) {
-          _sum += _.p[0][order[_k]][1];
-        };
+          _sum += prices[order[_k]][1];
+        }
 
-        //If average price of these sequential hours is lower -> it's better
         if (_sum / _cnt < _avg) {
           _avg = _sum / _cnt;
           _startIndex = _j;
@@ -1091,46 +1129,34 @@ function isCheapestHour(inst) {
       }
 
     } else {
-      //Sort indexes by price
-      _j = 0;
-
       for (_k = 1; _k < order.length; _k++) {
         let temp = order[_k];
-
-        for (_j = _k - 1; _j >= 0 && _.p[0][temp][1] < _.p[0][order[_j]][1]; _j--) {
+        for (_j = _k - 1; _j >= 0 && prices[temp][1] < prices[order[_j]][1]; _j--) {
           order[_j + 1] = order[_j];
         }
         order[_j + 1] = temp;
       }
 
-      //Select the cheapest ones
       for (_j = 0; _j < _cnt; _j++) {
         cheapest.push(order[_j]);
       }
     }
 
-    //If custom period, quit when all periods are done (1 or 2 periods)
     if (cfg.m2.p == -1 || (cfg.m2.p == -2 && _i >= 1))
       break;
   }
 
-  //Check if current hour is cheap enough
   let epochNow = epoch();
-  let res = false;
 
   for (let i = 0; i < cheapest.length; i++) {
-    let row = _.p[0][cheapest[i]];
-
+    let row = prices[cheapest[i]];
     if (isCurrentHour(row[0], epochNow)) {
-      //This hour is active -> current hour is one of the cheapest
-      res = true;
-      break;
+      return true;
     }
   }
 
-  return res;
+  return false;
 }
-
 /**
  * Update current price to _.s.p[0].now
  * Returns true if OK, false if failed
@@ -1370,6 +1396,17 @@ log("v." + _.s.v);
 log("URL: http://" + (Shelly.getComponentStatus("wifi").sta_ip ?? "192.168.33.1") + "/script/" + Shelly.getCurrentScriptId());
 
 initialize();
+
+Shelly.call("KVS.Get", { key: "monthData" }, function(res) {
+  if (res && res.value) {
+    try {
+      monthData = JSON.parse(res.value);
+      log("monthData loaded");
+    } catch(e) {
+      log("monthData parse failed");
+    }
+  }
+});
 
 //Start server and loop
 HTTPServer.registerEndpoint('', onServerRequest);
